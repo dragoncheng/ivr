@@ -12,12 +12,20 @@ enum
 	FSMSTATE_IDLE,								// 空闲
 	FSMSTATE_READYFORWELCOMEWORDTXT,			// 准备播放提示词的TXT部分
 	FSMSTATE_PLAYINGWELCOMEWORDTXT,				// 正在播放提示词的TXT部分
+	FSMSTATE_READYFORMANUALTXT,					// 准备播放手工按键的TXT部分
+	FSMSTATE_PLAYINGMANUALTXT,					// 正在播放手工按键的TXT部分
+	FSMSTATE_READYFORVOICETXT,					// 准备播放语音识别的TXT部分
+	FSMSTATE_PLAYINGVOICETXT,					// 正在播放语音识别的TXT部分
+	FSMSTATE_PLAYINGTXTFINISHED,				// 语音播放结束
 	FSMSTATE_READYFORRECORDMARK,				// 准备播放 "嘟"
 	FSMSTATE_PLAYINGRECORDMARK,					// 正在播放 "嘟"
 	FSMSTATE_READYFORRECORD,					// 准备录音
 	FSMSTATE_RECORDING,							// 正在录音
 	FSMSTATE_READYFORRECEIVEDTXT,				// 准备播放从服务器收到的TXT
 	FSMSTATE_PLAYINGRECEIVEDTXT,				// 正在播放从服务器收到的TXT
+	FSMSTATE_READYFORSELECTMODE,				// 等待用户选择手工模式还是语音模式
+	FSMSTATE_WAITSELECTMODE,					// 等待用户选择手工模式还是语音模式
+	FSMSTATE_WAITFORSTOCKNO,					// 等待输入股票代码
 	FSMSTATE_LIMIT
 };
 //-----------------------------------------------------------------------------------------------------------------------
@@ -31,21 +39,22 @@ enum EGPRAppType
 	EGPRAppType_transfer,							/* 转接报文 */
 	EGPRAppType_audio,								/* 音频数据 */
 	EGPRAppType_Text,								/* 文本数据 */
+	EGPRAppType_AudioTextEx,						/* 音频文本扩展数据 */
+	EGPRAppType_KeyButton,							/* keybutton */
 };
 
 enum 
 {
 	FSMWELCOMESTATE_IDLE,
-	FSMWELCOMESTATE_FOUND,
-	FSMWELCOMESTATE_LOST,
+	FSMWELCOMESTATE_CALLED,
 };
 
 enum ERecordMode
 {
 	ERecordMode_RECORD,			/* 录音 */	
 	ERecordMode_STOPRECORD,		/* 不录音 */	
-	ERecordMode_RECDTMF,		/* 按键 */	
-}
+	ERecordMode_REVDTMF,		/* 按键 */	
+};
 //-----------------------------------------------------------------------------------------------------------------------
 //	与某个服务器的连接对象
 //-----------------------------------------------------------------------------------------------------------------------
@@ -64,13 +73,14 @@ struct CTCPConnection
 	int GetHZVoiceOnePDULen();							// 取来自识别服务器消息的长度（含头部分）
 	int OnHZVoiceSvrPDUArrived(char * s,int sLen);				// 处理来自识别服务器的消息
 	int SendFormattedPacket(const char * Format,...);				// 向 IPS 板发送格式消息
-	int SendVoiceDataToHZServer(int nPid,char * sVoiceData,int nVoiceLen);
+	int SendDataToHZServer(int nPid,char * sVoiceData,int nVoiceLen, int appType);
 };
 
 //-----------------------------------------------------------------------------------------------------------------------
 //	业务控制块（FSM）
 //-----------------------------------------------------------------------------------------------------------------------
-#define HZIVR_TXTBUF_MAX 0x500
+#define HZIVR_TXTBUF_MAX 0x1000
+#define HZIVR_TDMF_LEN   20
 struct CHZIVRFSMItem
 {
 	int  m_Pid;
@@ -84,13 +94,15 @@ struct CHZIVRFSMItem
 	int  m_RecordDelay;
 	bool m_proctime;
 	ERecordMode  m_RecordMode;					/* 从ivr获取处理模式 */
+	char m_DtmfCode[HZIVR_TDMF_LEN];			/*  按键 */
+	int  m_DtmfOff;
 
 	int InitFSMData(int nPid,char * sParaBlock,int nParaLen);
 	int OnMsgArrived(int nReqCode,char * s,int sLen);
 	int ProcessTimer(int nTimerUnitInMiliseconds);
 	int AppendText(char * s,int sLen);
 	int GetText(char * s,int sLimit);
-	CHZIVRFSMItem(){m_Pid=-1;};
+	CHZIVRFSMItem(){m_Pid=-1; m_RecordMode=ERecordMode_RECORD;};
 	~CHZIVRFSMItem();
 };
 
@@ -323,19 +335,6 @@ int glbServiceLogicFun_GetFSMObjVol()
 
 CHZIVRFSMItem::~CHZIVRFSMItem()
 {
-	/*
-	if (m_Pid>=FSM_PID_MAX || m_Pid<0) 
-	{
-		if (m_Pid!=-1)
-		{
-			g_fsmhandle=NULL;
-		}
-	}
-	else
-	{
-		g_fsm_pids[m_Pid]=NULL;
-	}
-	*/
 	Log("会话销毁 pid=%d, obj=0x%x\r\n",m_Pid,(int)this);
 }
 //-----------------------------------------------------------------------------------------------------------------------
@@ -351,16 +350,6 @@ int CHZIVRFSMItem::InitFSMData(int nPid,char * sParaBlock,int nParaLen)
 	m_WelcomeState=FSMWELCOMESTATE_IDLE;
 	m_RecordDelay=0;
 	m_proctime = false;
-/*
-	if (nPid>=FSM_PID_MAX || nPid<0) 
-	{
-		g_fsmhandle=this;
-	}
-	else
-	{
-		g_fsm_pids[nPid]=this;
-	}
-	*/
 	Log("会话初始化 pid=%d, obj=0x%x\r\n",nPid,(int)this);
 
 	return 0;
@@ -374,6 +363,7 @@ int CHZIVRFSMItem::OnMsgArrived(int nReqCode,char * s,int sLen)
 	CCommonParameter p;
 	int nPartyid,nVoiceLen;
 	char * sVoiceData;
+	char* DTMFCode;
 
 	p.BindString(s,sLen,0);
 	switch(nReqCode)
@@ -385,6 +375,45 @@ int CHZIVRFSMItem::OnMsgArrived(int nReqCode,char * s,int sLen)
 		return -1;
 
 	case VOICEPLATFORMCMDCODE_DTMF_NUMBER:					// DTMF
+		nPartyid=p.GetBYTE();							// 收到的号码对应的参与方的编号，它应该是 0
+		DTMFCode=p.GetASCIIZString();
+		Log("DTMF[%d][%d]=%s\r\n",m_Pid,nPartyid,DTMFCode);
+		if (nPartyid!=0) break;
+		switch (m_State)
+		{
+		case FSMSTATE_WAITSELECTMODE:
+			if (DTMFCode[0]=='2')
+			{
+				m_State = FSMSTATE_READYFORMANUALTXT;
+			}
+			else
+			{
+				m_State = FSMSTATE_READYFORVOICETXT;
+			}
+			m_DtmfOff = 0;
+			break;
+
+		case FSMSTATE_WAITFORSTOCKNO:
+			if (DTMFCode[0]=='#')
+			{
+				glbWorkData.m_Conn_From_VoiceSvr.SendDataToHZServer(m_Pid,m_DtmfCode,m_DtmfOff,EGPRAppType_KeyButton);
+				m_State = FSMSTATE_READYFORRECEIVEDTXT;
+				m_DtmfOff = 0;
+			}
+			else
+			{
+				m_DtmfCode[m_DtmfOff] = DTMFCode[0];
+				if (m_DtmfOff < HZIVR_TDMF_LEN - 2)
+				{
+					m_DtmfOff++;
+				}
+				m_DtmfCode[m_DtmfOff]=0;
+			}
+			break;
+		default:
+			Log("DTMF[%d][%d] ERROR State=%d\r\n",m_Pid,nPartyid,m_State);
+			break;
+		}
 		break;
 
 	case VOICEPLATFORMCMDCODE_CALLED_STATE:					// 被叫状态
@@ -401,17 +430,27 @@ int CHZIVRFSMItem::OnMsgArrived(int nReqCode,char * s,int sLen)
 
 	case VOICEPLATFORMCMDCODE_PLAYVOICEFINISHED:				// 语音播放结束
 		Log("FSM[%d] VOICEPLATFORMCMDCODE_PLAYVOICEFINISHED flag=%d state=%d\r\n",m_Pid,m_RecordFlag,m_State);
-		if (m_State==FSMSTATE_PLAYINGWELCOMEWORDTXT)						// 如果状态也是“正在播放”
+		switch(m_State)
 		{
-			m_State=FSMSTATE_READYFORRECORDMARK;						// 状态回到“等待文本”状态
-		}
-		else if(m_State==FSMSTATE_PLAYINGRECORDMARK)
-		{
-			m_State=FSMSTATE_READYFORRECORD;
-		}
-		else if(m_State==FSMSTATE_PLAYINGRECEIVEDTXT)
-		{
-			m_State=FSMSTATE_IDLE;
+			case FSMSTATE_PLAYINGWELCOMEWORDTXT:
+				m_State = FSMSTATE_READYFORSELECTMODE;
+				break;
+
+			case FSMSTATE_PLAYINGVOICETXT:
+				m_State = FSMSTATE_READYFORRECORDMARK;
+				break;
+
+			case FSMSTATE_PLAYINGMANUALTXT:
+				m_State = FSMSTATE_WAITFORSTOCKNO;
+				break;
+
+			case FSMSTATE_PLAYINGRECORDMARK:
+				m_State=FSMSTATE_READYFORRECORD;
+				break;
+
+			case FSMSTATE_PLAYINGRECEIVEDTXT:
+				m_State = FSMSTATE_PLAYINGTXTFINISHED;
+				break;
 		}
 		break;
 
@@ -422,13 +461,16 @@ int CHZIVRFSMItem::OnMsgArrived(int nReqCode,char * s,int sLen)
 		nPartyid=p.GetBYTE();							// 它一定是 0，因为只开启了对主叫方的录音
 		nVoiceLen=p.GetDWORD();							// 录音数据长度（字节数）
 		sVoiceData=p.GetBinDataBlock(nVoiceLen);				// 录音数据
-		if (m_RecordFlag==1)
+		if (m_RecordMode == ERecordMode_RECORD)
 		{
-			glbWorkData.m_Conn_From_VoiceSvr.SendVoiceDataToHZServer(m_Pid,sVoiceData,nVoiceLen);
-		}
-		else if (m_State != FSMSTATE_PLAYINGRECEIVEDTXT)
-		{
-			Log("FSM[%d] VOICEPLATFORMCMDCODE_RECORDVOICE flag=%d state=%d\r\n",m_Pid,m_RecordFlag,m_State);
+			if (m_RecordFlag==1)
+			{
+				glbWorkData.m_Conn_From_VoiceSvr.SendDataToHZServer(m_Pid,sVoiceData,nVoiceLen,EGPRAppType_audio);
+			}
+			else if (m_State != FSMSTATE_PLAYINGRECEIVEDTXT)
+			{
+				Log("FSM[%d] VOICEPLATFORMCMDCODE_RECORDVOICE flag=%d state=%d\r\n",m_Pid,m_RecordFlag,m_State);
+			}
 		}
 		break;
 
@@ -457,8 +499,7 @@ int CHZIVRFSMItem::OnMsgArrived(int nReqCode,char * s,int sLen)
 int CHZIVRFSMItem::ProcessTimer(int nTimerUnitInMiliseconds)
 {
 	char sText[1024];
-	int  n,k,ntot;
-	char sVoiceData[2000];
+	int  n,ntot;
 	if (m_proctime)
 	{
 		return 0;
@@ -477,106 +518,75 @@ int CHZIVRFSMItem::ProcessTimer(int nTimerUnitInMiliseconds)
 //		AppendText("欢迎使用股票语音服务系统,请在滴的一声后讲话,讲话时请用普通话,谢谢.",-1);	// 播放提示词
 		break;
 
-		//	int glbPlayStoredVoiceData(int nChid,char * sTagname)
-		//	int glbStopPlayVoice(int nChid)
-
 	case FSMSTATE_READYFORWELCOMEWORDTXT:							// 如果状态是“等待文本”
-//		n=GetText(sText,sizeof(sText)-4);
-//		if (n>0)								// 若已有文本
+		ntot = _play_tts(m_Pid,"欢迎使用浙江电信号码百事通股票查询系统，进入股票名称智能语音查询，请按1;进入输入股票代码查询，请按2");
+		if (ntot>0)
 		{
-			switch(m_WelcomeState)
-			{
-				case FSMWELCOMESTATE_FOUND:
-				{
-					#if 0
-					#if TTS_USE_MUTEX
-						ntot = _play_tts(m_Pid,"如需查询其他股票，请您在滴的一声后讲出股票名称.");
-					#else
-						Log("FSM[%d] 播放 %s\r\n",m_Pid,"如需查询其他股票，请您在滴的一声后讲出股票名称.");
-			//			glbOpenTTS(0,sText);						// 打开 TTS
-						glbOpenTTS(0,"如需查询其他股票，请您在滴的一声后讲出股票名称.");	// 打开 TTS
-						ntot=0;
-						for (;;)
-						{
-							memset(sVoiceData,0,sizeof(sVoiceData));
-							k=glbReadTTSPCMData(0,sVoiceData,sizeof(sVoiceData)-4);		// 取出语音
-							if (k<1) break;							// 取完，退出循环
-							glbPlayVoiceData(0,sVoiceData,k);				// 播放
-							ntot+=k;							// 播放的总字节数
-						}
-						glbCloseTTS(0);							// 关闭 TTS
-					#endif
-					if (ntot>0)
-					{
-						m_State=FSMSTATE_PLAYINGWELCOMEWORDTXT;					// 状态转为“播放状态”
-						m_Timer=0;
-						m_RecordDelay=1;
-					}
-					m_RecordFlag = 0;
-					#else
-					Log("FSM[%d] 播放 %s\r\n",m_Pid,"没查询到股票");
-					glbPlayStoredVoiceData(0,"RECORDTAG");
-					m_State=FSMSTATE_PLAYINGRECORDMARK;
-					m_Timer=0;
-					m_WelcomeState=4;
-					#endif
-				}
-				m_WelcomeState=FSMWELCOMESTATE_FOUND;
-				break;
+			m_State=FSMSTATE_PLAYINGWELCOMEWORDTXT;					// 状态转为“播放状态”
+			m_Timer=0;
+			m_RecordDelay=1;
+		}
+		m_RecordFlag = 0;
+		m_RecordMode = ERecordMode_RECORD;
+		break;
 
-				case FSMWELCOMESTATE_LOST:
-					Log("FSM[%d] 播放 %s\r\n",m_Pid,"没查询到股票");
-					glbPlayStoredVoiceData(0,"RECORDTAG");
-					m_State=FSMSTATE_PLAYINGRECORDMARK;
-					m_Timer=0;
-					m_WelcomeState=4;
+	case FSMSTATE_READYFORVOICETXT:
+		ntot = _play_tts(m_Pid,"欢迎使用浙江电信号码百事通股票自动语音查询系统，请在“都”的一声后用普通话讲出您要查询的股票名称，不要讲股票代码.谢谢.");
+		if (ntot>0)
+		{
+			m_State = FSMSTATE_PLAYINGVOICETXT;
+			m_Timer = 0;
+			m_RecordDelay = 1;
+		}
+		m_RecordFlag = 0;
+		break;
+
+	case FSMSTATE_READYFORMANUALTXT:
+		ntot = _play_tts(m_Pid,"欢迎使用浙江电信号码百事通股票自动查询系统，请输入你的股票代码，以井号键结束.");
+		if (ntot>0)
+		{
+			m_State = FSMSTATE_PLAYINGMANUALTXT;
+			m_Timer = 0;
+			m_RecordDelay = 1;
+		}
+		m_RecordFlag = 0;
+		break;
+
+	case FSMSTATE_PLAYINGTXTFINISHED:
+		{
+			switch(m_RecordMode)
+			{
+				case ERecordMode_REVDTMF:
+					glbStartRecvDTMF(0);							// 开始为主叫收 DTMF 号码
+					m_State = FSMSTATE_WAITFORSTOCKNO;
+					Log("FSM[%d] get dtmf code \r\n",m_Pid);
 					break;
 
-				case FSMWELCOMESTATE_IDLE:
-				{
-					#if TTS_USE_MUTEX
-						ntot = _play_tts(m_Pid,"欢迎使用浙江电信号码百事通股票自动语音查询系统，请在“都”的一声后用普通话讲出您要查询的股票名称，不要讲股票代码.谢谢.");
-					#else
-						Log("FSM[%d] 播放 %s\r\n",m_Pid,"欢迎使用股票自动语音查询系统，请在滴的一声后用普通话讲出您要查询的股票名称，不要讲股票代码,谢谢");
-			//			glbOpenTTS(0,sText);						// 打开 TTS
-						glbOpenTTS(0,"欢迎使用股票自动语音查询系统，请在滴的一声后用普通话讲出您要查询的股票名称，不要讲股票代码,谢谢.");	// 打开 TTS
-						ntot=0;
-						for (;;)
-						{
-							memset(sVoiceData,0,sizeof(sVoiceData));
-							k=glbReadTTSPCMData(0,sVoiceData,sizeof(sVoiceData)-4);		// 取出语音
-							if (k<1) break;							// 取完，退出循环
-							glbPlayVoiceData(0,sVoiceData,k);				// 播放
-							ntot+=k;							// 播放的总字节数
-						}
-						glbCloseTTS(0);							// 关闭 TTS
-					#endif
-					if (ntot>0)
-					{
-						m_State=FSMSTATE_PLAYINGWELCOMEWORDTXT;					// 状态转为“播放状态”
-						m_Timer=0;
-						m_RecordDelay=1;
-					}
-					m_RecordFlag = 0;
-				}
-				m_WelcomeState=FSMWELCOMESTATE_FOUND;
-				break;
-			
-			default:
-				m_State=FSMSTATE_PLAYINGRECORDMARK;
-				break;
+				case ERecordMode_RECORD:
+					glbPlayStoredVoiceData(0,"RECORDTAG");
+					m_State = FSMSTATE_PLAYINGRECORDMARK;
+					Log("FSM[%d] playing recordtag \r\n",m_Pid);
+					break;
 
+				default:
+					m_State = FSMSTATE_READYFORRECORD;
+					Log("FSM[%d] playing voice finish \r\n",m_Pid);
+					break;
 			}
+			m_RecordFlag = 0;
+			m_Timer=0;
 		}
+		break;
+	case FSMSTATE_READYFORSELECTMODE:
+		glbStartRecvDTMF(0);							// 开始为主叫收 DTMF 号码
+		m_State = FSMSTATE_WAITSELECTMODE;
+		Log("FSM[%d] enter dtmf mode \r\n",m_Pid);
 		break;
 
-	case FSMSTATE_PLAYINGWELCOMEWORDTXT:							// 正在播放
+	case FSMSTATE_WAITSELECTMODE:
 		m_Timer+=nTimerUnitInMiliseconds;
-		if (m_Timer>=180000)							// 已过 2 分钟
-		{
-			m_State=FSMSTATE_READYFORWELCOMEWORDTXT;
-		}
-		break;
+		if (m_Timer<60000) break;						// 等 60 秒
+		return -1;								// 到了 60 秒没输入，返回 -1 ，业务结束
 
 	case FSMSTATE_READYFORRECORDMARK:
 		if (m_RecordDelay<=0)
@@ -584,6 +594,7 @@ int CHZIVRFSMItem::ProcessTimer(int nTimerUnitInMiliseconds)
 			glbPlayStoredVoiceData(0,"RECORDTAG");
 			m_State=FSMSTATE_PLAYINGRECORDMARK;
 			m_Timer=0;
+			m_RecordDelay = 0;
 		}
 		else
 		{
@@ -600,62 +611,41 @@ int CHZIVRFSMItem::ProcessTimer(int nTimerUnitInMiliseconds)
 		break;
 
 	case FSMSTATE_READYFORRECORD:
-		switch(m_RecordFlag)
+		if (m_RecordMode != ERecordMode_REVDTMF)
 		{
-			case 0:
-				glbStartRecordVoice(0);							// 开始对主叫录音
-				m_RecordFlag=1;
-				break;
-			case 1:
-				break;
-			default:
-				m_RecordFlag=1;
+			switch(m_RecordFlag)
+			{
+				case 0:
+					glbStartRecordVoice(0);							// 开始对主叫录音
+					m_RecordFlag=1;
+					break;
+				case 1:
+					break;
+				default:
+					m_RecordFlag=1;
+			}
 		}
 		m_State=FSMSTATE_RECORDING;
 		m_Timer=0;
 		break;
 
 	case FSMSTATE_RECORDING:
-/*
-		m_Timer+=nTimerUnitInMiliseconds;
-		if (m_Timer>=120000)							// 已过 2 分钟
-		{
-			m_State=FSMSTATE_IDLE;
-		}
-*/
 		m_State=FSMSTATE_READYFORRECEIVEDTXT;
 		break;
+
+	case FSMSTATE_WAITFORSTOCKNO:
+		m_Timer+=nTimerUnitInMiliseconds;
+		if (m_Timer<60000) break;						// 等 60 秒
+		return -1;								// 到了 60 秒没输入，返回 -1 ，业务结束
+
 
 	case FSMSTATE_READYFORRECEIVEDTXT:
 		n=GetText(sText,sizeof(sText)-4);
 		if (n>0)								// 若已有文本
 		{
-			#if TTS_USE_MUTEX
-				ntot = _play_tts(m_Pid,sText);
-			#else
-				Log("FSM[%d][%lu] 播放 %s\r\n",m_Pid,_getcurrentms(),sText);
-				glbOpenTTS(0,sText);						// 打开 TTS
-				ntot=0;
-				for (;;)
-				{
-					memset(sVoiceData, 0, sizeof(sVoiceData));
-					k=glbReadTTSPCMData(0,sVoiceData,sizeof(sVoiceData)-4);		// 取出语音
-					if (k<1) break;							// 取完，退出循环
-					glbPlayVoiceData(0,sVoiceData,k);				// 播放
-					ntot+=k;							// 播放的总字节数
-				}
-				glbCloseTTS(0);							// 关闭 TTS
-			#endif
+			ntot = _play_tts(m_Pid,sText);
 			if (ntot>0)
 			{
-				if (memcmp(sText,"对不起",strlen("对不起")) ==0 )
-				{
-					m_WelcomeState = FSMWELCOMESTATE_LOST;
-				}
-				else
-				{
-					m_WelcomeState = FSMWELCOMESTATE_FOUND;	
-				}
 				m_State=FSMSTATE_PLAYINGRECEIVEDTXT;					// 状态转为“播放状态”
 				m_Timer=0;
 				m_RecordFlag = 0;
@@ -994,7 +984,6 @@ int CTCPConnection::GetHZVoiceOnePDULen()
 	p.GetBYTE();
 	p.GetBYTE();
 	int k=p.GetDWORD();
-//	Log("收到语音数据 len=%d pos=%d\r\n",k,m_Pos);
 	if (m_Pos>=k+HZPDU_HDR_LEN)
 	{
 		return k+HZPDU_HDR_LEN;
@@ -1022,7 +1011,7 @@ int CTCPConnection::SendFormattedPacket(const char * Format,...)
 //-----------------------------------------------------------------------------------------------------------------------
 //	向识别服务器发一段语音
 //-----------------------------------------------------------------------------------------------------------------------
-int CTCPConnection::SendVoiceDataToHZServer(int nPid,char * sVoiceData,int nVoiceLen)
+int CTCPConnection::SendDataToHZServer(int nPid,char * sVoiceData,int nVoiceLen, int appType)
 {
 	char ss[2000];
 	int i,k;
@@ -1041,7 +1030,7 @@ int CTCPConnection::SendVoiceDataToHZServer(int nPid,char * sVoiceData,int nVoic
 			p.PutBYTE('G');
 			p.PutBYTE('L');
 			p.PutBYTE(0);							// version
-			p.PutBYTE(EGPRAppType_audio);			// app Type
+			p.PutBYTE(appType);			// app Type
 			p.PutDWORD(k+HZPDU_HDR_LEN);						// payLoad Size
 			p.PutDWORD(nPid);						// Pid
 			p.PutDWORD(0);							// SN
@@ -1089,6 +1078,7 @@ int CTCPConnection::OnHZVoiceSvrPDUArrived(char * s,int sLen)
 	CCommonParameter p;
 	int nPid,CountOfFSM,i;
 	int a[2000];
+	ERecordMode mode;
 
 	p.BindString(s,sLen,1);
 
@@ -1097,6 +1087,7 @@ int CTCPConnection::OnHZVoiceSvrPDUArrived(char * s,int sLen)
 	int tversion=p.GetBYTE();
 	int tappType=p.GetBYTE();
 	int payloadLen=p.GetDWORD();
+
 	char * payloadBody=p.GetBinDataBlock(payloadLen);
 
 //	Log("收到来自识别服务器的消息 LEN=%d SIG1=%d SIG2=%d type=%d\r\n",sLen,cc1,cc2,tappType);
@@ -1124,45 +1115,6 @@ int CTCPConnection::OnHZVoiceSvrPDUArrived(char * s,int sLen)
 			p.BindString(payloadBody,payloadLen,1);
 			nPid=p.GetDWORD();							// 取出 PID
 			p.GetDWORD();							// sn
-#if 0
-			{
-				int VoiceLen;
-				char * VoiceData;
-				char tempbuffer[2000];
-				VoiceData=p.GetRemainBinBlock(&VoiceLen);			// 把 TXT 放入缓冲区
-				char temp[2000];
-				memcpy(temp,VoiceData, VoiceLen);
-				temp[VoiceLen]='\0';
-				Utf8ToGB2312(temp, tempbuffer);
-				tempbuffer[VoiceLen] = '\0';
-				Log("收到来自识别服务器的语音数据消息 nPid=%d msg=%s\r\n",nPid,tempbuffer);
-			
-				if (nPid>=FSM_PID_MAX || nPid<0) 
-				{
-					if (g_fsmhandle!=NULL)
-					{
-						g_fsmhandle->AppendText(tempbuffer, VoiceLen);
-					}
-					else
-					{
-						Log("WARNING:illegal fsm machatine pid=%d\r\n",nPid);
-					}
-				}
-				else
-				{
-					if (g_fsm_pids[nPid]!=NULL)
-					{
-						g_fsm_pids[nPid]->AppendText(tempbuffer, VoiceLen);
-					}
-					else
-					{
-						Log("WARNING:illegal fsm machatine pid(pid)=%d\r\n",nPid);
-					}
-				}
-
-			}
-#endif
-#if 1
 			CountOfFSM=glbGetAllFSMObjs(a,2000);				// 取出该模块下所有的 FSM
 			for (i=0;i<CountOfFSM;i++)						// 在这些 FSM 中查找
 			{
@@ -1188,7 +1140,40 @@ int CTCPConnection::OnHZVoiceSvrPDUArrived(char * s,int sLen)
 					break;
 				}
 			}
-#endif
+			break;
+		case EGPRAppType_AudioTextEx:					/* 文本数据, 格式：PID(4B) 文本(nB)*/
+			p.BindString(payloadBody,payloadLen,1);
+			nPid=p.GetDWORD();							// 取出 PID
+			p.GetDWORD();								// sn
+			mode = (ERecordMode)p.GetDWORD();
+			CountOfFSM=glbGetAllFSMObjs(a,2000);				// 取出该模块下所有的 FSM
+			for (i=0;i<CountOfFSM;i++)						// 在这些 FSM 中查找
+			{
+				CHZIVRFSMItem * pFSM;
+
+				pFSM=(CHZIVRFSMItem *)a[i];
+				Log("FSM pid=%d\r\n",pFSM->m_Pid);
+				if (pFSM->m_Pid==nPid)						// 找到
+				{
+					int VoiceLen;
+					char * VoiceData;
+					char tempbuffer[2000];
+					VoiceData=p.GetRemainBinBlock(&VoiceLen);			// 把 TXT 放入缓冲区
+					
+					char temp[2000];
+					memcpy(temp,VoiceData, VoiceLen);
+					temp[VoiceLen]='\0';
+					Utf8ToGB2312(temp, tempbuffer);
+					tempbuffer[VoiceLen] = '\0';
+					pFSM->AppendText(tempbuffer,VoiceLen);
+					pFSM->m_RecordMode = mode;
+					pFSM->m_DtmfOff = 0;
+					Log("FSM[%d][%d]收到来自识别服务器的扩展TXT发往[%d][%d][mode=%d]:%s \r\n",
+							nPid,_getcurrentms(),VoiceLen,payloadLen,mode,tempbuffer);
+
+					break;
+				}
+			}
 			break;
 		}
 	}
