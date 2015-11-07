@@ -1,0 +1,11 @@
+LIBRARY      HZIVR
+EXPORTS
+	glbServiceLogicFun_OnDLLLoaded     @1
+	glbServiceLogicFun_GetServiceName  @2
+	glbServiceLogicFun_GetFSMObjVol    @3
+	glbServiceLogicFun_InitFSMObj      @4
+	glbServiceLogicFun_OnMsgArrived    @5
+	glbServiceLogicFun_OnTimer         @6
+	glbServiceLogicFun_OnDestroy       @7
+	glbServiceLogicFun_EventProcess    @8
+	glbServiceLogicFun_ModuleScanning  @9
